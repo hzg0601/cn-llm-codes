@@ -576,7 +576,7 @@ class GLMBlock(torch.nn.Module):
 
 
 class GLMTransformer(torch.nn.Module):
-    """Transformer class."""
+    """Transformer class., return output with size [s, b, h] """
 
     def __init__(self, config: ChatGLMConfig, device=None):
         super(GLMTransformer, self).__init__()
@@ -753,6 +753,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         self.rotary_pos_emb = RotaryEmbedding(rotary_dim // 2, rope_ratio=config.rope_ratio,original_impl=config.original_rope, 
                                               device=device, dtype=config.torch_dtype)
         self.encoder = init_method(GLMTransformer, config, **init_kwargs)
+        # [sq,b,h]@[h,vocab_size] -> [b,seq,vocab_size]
         self.output_layer = init_method(nn.Linear, config.hidden_size, config.padded_vocab_size, bias=False,
                                         dtype=config.torch_dtype, **init_kwargs)
         self.pre_seq_len = config.pre_seq_len
@@ -944,7 +945,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         hidden_states = transformer_outputs[0]
         if return_last_logit:
             hidden_states = hidden_states[-1:]
+       
         lm_logits = self.transformer.output_layer(hidden_states)
+        # [b,sq,vocab_size]
         lm_logits = lm_logits.transpose(0, 1).contiguous()
 
         loss = None
@@ -952,6 +955,7 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             lm_logits = lm_logits.to(torch.float32)
 
             # Shift so that tokens < n predict n
+            # 不保留最后一个字符的logits,去除第一个label
             shift_logits = lm_logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             # Flatten the tokens
@@ -1141,6 +1145,10 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         while True:
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
+            # outputs -> [b,sq,vocab_size]
+            # 每一轮调用模型的forward方法，得到一个outputs，其shape [b,sq,vocab_size]
+            # 取出最后一个token的logits，进行logits处理，然后进行采样，得到token的id
+            # 将新得的token_id加入input_ids,直到达到停止条件。
             outputs = self(
                 **model_inputs,
                 return_dict=True,
