@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import argparse
 from typing import Union
-from datasets import load_dataset
+from datasets import load_dataset,DownloadConfig
 
 
 def recursive_load_dataset(dataset_name,name=None,data_files=None,max_try=300):
@@ -16,7 +16,8 @@ def recursive_load_dataset(dataset_name,name=None,data_files=None,max_try=300):
     try_turn = 0
     while True:
         try:
-            data = load_dataset(dataset_name,name=name,data_files=data_files) 
+            config = DownloadConfig(resume_download=True, max_retries=300)
+            data = load_dataset(dataset_name,name=name,data_files=data_files,download_config=config) 
             return data
         except Exception as e:
             print(e)
