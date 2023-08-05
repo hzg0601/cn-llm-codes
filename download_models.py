@@ -7,42 +7,27 @@ import shutil
 import subprocess
 import argparse
 from typing import Union
-def recursively_load_model(LoaderClass,
-                           checkpoint,
-                           config=None,
-                           torch_dtype=None,
-                           trust_remote_code=True, 
-                           resume_download=True,
-                           max_try=300,
-                           kwargs=None):
-    """国内加载模型经常出现ConnectionError,所以需要多次重复下载
-        多次调用LoadClass.from_pretrained加载模型，直至成功或超过`max_try`次
-    """
+from datasets import load_dataset
 
+
+def recursive_load_dataset(dataset_name,name=None,data_files=None,max_try=300):
+    #for some regions and countries, `load_dataset` casually raise ConnectionError, 
+    # so recursively downloading the dataset would make the project more robust.
+    try_turn = 0
     while True:
         try:
-            
-            if config is not None:
-                print(config,checkpoint)
-                print("*"*80)
-                model = LoaderClass.from_pretrained(checkpoint,
-                                             config=config,
-                                             torch_dtype=torch_dtype,
-                                             trust_remote_code=trust_remote_code,
-                                             resume_download=resume_download) 
-            else:
-                print(checkpoint, kwargs)
-                print("-"*80)
-                model = LoaderClass.from_pretrained(checkpoint,**kwargs)
-            return model
+            data = load_dataset(dataset_name,name=name,data_files=data_files) 
+            return data
         except Exception as e:
-            print("Download model failed, re-downloading...")
+            print(e)
+            print("Download dataset failed, re-downloading...")
             try_turn += 1
             if try_turn > max_try:
                 print("The number of retries exceeded `max_try`,maybe you are offline, please check the network.")
                 raise ConnectionError
             else:
-                continue    
+                continue
+
 
 def recursive_download_file(repo_id,
                             filename=None,
@@ -125,6 +110,7 @@ def recursive_download_file(repo_id,
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="auto download from huggingface_hub",description="自动从huggingface hub下载文件")
+    parser.add_argument("--function",default='recursive_download_file',type=str)
     parser.add_argument("--repo-id",type=str,default="bigscience/tokenizer")
     parser.add_argument("--filename",type=str,default=None)
     parser.add_argument("--cache-dir",type=str,default=None)
@@ -135,7 +121,23 @@ if __name__ == "__main__":
     parser.add_argument("--rename-files",type=Union[bool,str,None],default=False,
                         help="""whether to rename the downloaded file, if True, use huggingface_hub's default directory; 
                         if str,input the directory of the soft links""")
-    parser.add_argument("--max-try",type=int,default=3000)
+    parser.add_argument("--max-try",type=int,default=300)
+
+    parser.add_argument("--dataset-name",type=str,default="Dahoas/rm-static")
+    parser.add_argument("--name",default=None,type=str)
+    parser.add_argument("--data-files",default=None,type=str)
+
+    load_dataset_args = ["dataset_name","name","data_files","max_try"]
+
     args = parser.parse_args()
     args_dict = vars(args)
-    recursive_download_file(**args_dict)
+    function_call_str = args_dict.pop("function")
+    print(function_call_str)
+    function_call = eval(function_call_str)
+    if function_call_str == "recursive_load_dataset":
+        args_dict_use = {key:value for key,value in args_dict.items() if key in load_dataset_args}
+        print(args_dict_use)
+    else:
+        args_dict_use = {key:value for key, value in args_dict.items() if key not in load_dataset_args}
+    function_call(**args_dict_use)
+    # recursive_download_file(**args_dict)
