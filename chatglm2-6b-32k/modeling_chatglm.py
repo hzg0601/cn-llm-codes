@@ -314,6 +314,20 @@ class SelfAttention(torch.nn.Module):
 
     Self-attention layer takes input with size [s, b, h]
     and returns output of the same size.
+        1. [sq,b,h]的hidden_states输入进来以后，先执行query_key_value,将它们映射到一个统一的空间
+            如果使用MQA技术，则映射维度为proj_dim + 2 * head_dim * group_num;
+            如果不使用MQA技术，则映射维度为3*proj_dim
+        2. 将query_key_value分割，
+            如果使用MQA，三个划分维度为[num_head * head_dim, num_group * head_dim, num*group * head_dim]
+
+            如果不使用MQA，则全部为num_head * head_dim
+        3. 如有，将ROPE信息加入query, key
+        4. 如有，将新的key,value与kv-cache合并
+        5. 在key,value倒是第二个维度的位置增加一个维度，使用Tensor.expand方法将新增的维度拓展到num_heads/num_group维,
+            然后转换为[sq,b,num_heads,head_dim],初始时为[sq,b num_group,head_dim]
+        6. 执行scaled_dot_product_attention操作，得到context_layer
+        7. 执行线性映射，将proj_dim改为hidden_dim
+
     """
 
     def __init__(self, config: ChatGLMConfig, layer_number, device=None):
@@ -362,6 +376,22 @@ class SelfAttention(torch.nn.Module):
     def forward(
             self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True
     ):
+        """
+        1. [sq,b,h]的hidden_states输入进来以后，先执行query_key_value,将它们映射到一个统一的空间
+            如果使用MQA技术，则映射维度为proj_dim + 2 * head_dim * group_num;
+            如果不使用MQA技术，则映射维度为3*proj_dim
+        2. 将query_key_value分割，
+            如果使用MQA，三个划分维度为[num_head * head_dim, num_group * head_dim, num*group * head_dim]
+
+            如果不使用MQA，则全部为num_head * head_dim
+        3. 如有，将ROPE信息加入query, key
+        4. 如有，将新的key,value与kv-cache合并,更新key,value
+        5. 在key,value倒是第二个维度的位置增加一个维度，使用Tensor.expand方法将新增的维度拓展到num_heads/num_group维,
+            然后转换为[sq,b,num_heads,head_dim],初始时为[sq,b num_group,head_dim]
+        6. 执行scaled_dot_product_attention操作，得到context_layer
+        7. 执行线性映射，将proj_dim改为hidden_dim
+
+        """
         # hidden_states: [sq, b, h]
 
         # =================================================
@@ -369,11 +399,12 @@ class SelfAttention(torch.nn.Module):
         # =================================================
         # =====================
         # Query, Key, and Value
+        
         # =====================
 
-        # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+        # Attention heads [sq, b, h] --> [sq, b, full_dim]
         mixed_x_layer = self.query_key_value(hidden_states)
-
+        # num_attention_heads_per_partition = num_attention_heads
         if self.multi_query_attention:
             (query_layer, key_layer, value_layer) = mixed_x_layer.split(
                 [
@@ -408,6 +439,7 @@ class SelfAttention(torch.nn.Module):
             key_layer = apply_rotary_pos_emb(key_layer, rotary_pos_emb)
 
         # adjust key and value for inference
+        # 
         if kv_cache is not None:
             cache_k, cache_v = kv_cache
             key_layer = torch.cat((cache_k, key_layer), dim=0)
@@ -418,6 +450,9 @@ class SelfAttention(torch.nn.Module):
             kv_cache = None
 
         if self.multi_query_attention:
+            # 在key,value倒是第二个维度的位置增加一个维度，使用Tensor.expand方法将新增的维度拓展到num_heads/num_group维
+            # 然后转换为[sq,b,num_heads,head_dim]
+            # 初始时为[sq,b num_group,head_dim]
             key_layer = key_layer.unsqueeze(-2)
             key_layer = key_layer.expand(
                 -1, -1, -1, self.num_attention_heads_per_partition // self.num_multi_query_groups_per_partition, -1
@@ -535,6 +570,29 @@ class GLMBlock(torch.nn.Module):
     def forward(
             self, hidden_states, attention_mask, rotary_pos_emb, kv_cache=None, use_cache=True,
     ):
+        """
+        1. 上个block的输入，首先进行input_layernorm;
+        2. 然后执行self_attention:
+            2.1. [sq,b,h]的hidden_states输入进来以后，先执行query_key_value,将它们映射到一个统一的空间
+                如果使用MQA技术，则映射维度为proj_dim + 2 * head_dim * group_num;
+                如果不使用MQA技术，则映射维度为3*proj_dim
+            2.2. 将query_key_value分割，
+                如果使用MQA，三个划分维度为[num_head * head_dim, num_group * head_dim, num*group * head_dim]
+                如果不使用MQA，则全部为num_head * head_dim
+            2.3. 如有，将ROPE信息加入query, key
+            2.4. 如有，将新的key,value与kv-cache合并
+            2.5. 在key,value倒是第二个维度的位置增加一个维度，使用Tensor.expand方法将新增的维度拓展到num_heads/num_group维,
+                然后转换为[sq,b,num_heads,head_dim],初始时为[sq,b num_group,head_dim]
+            2.6. 执行scaled_dot_product_attention操作，得到context_layer
+            2.7. 执行线性映射，将proj_dim改为hidden_dim,输出结果attention_output和kv_cache
+        3. 对attention_output执行dropout
+        4. 若执行residual connection_post_layernorm, 将input_layernorm后的结果作为residual
+            否则以hidden_state为residual;
+        5. 执行post_layernorm;
+        6. post_layernorm输入MLP,执行position_wise mlp;
+        7. 再执行dropout和residual connection,步骤与前述3-4一致；
+
+        """
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -609,6 +667,40 @@ class GLMTransformer(torch.nn.Module):
             use_cache: Optional[bool] = True,
             output_hidden_states: Optional[bool] = False,
     ):
+        """ 
+        1. 如果不存在kv_caches, 构造容量为num_layer的kv_cache列表；
+        2. 如果要求输出所有隐含层，则构造容量为num_layer+的all_hidden_states元组；
+        3. 对每一层，如果使用gradient_checkpoint，且执行training任务
+            则加载该层的梯度检查点；
+            否则，执行该层的计算得到hidden_state和kv_cache
+            其中该层的kv_cache由在kv_cache列表中取出；
+            如果使用kv_cache技术，则将该层的kv_cache加入present中，故presents包含了所有层的kv_cache；
+        4. 如果要求输出所有隐含层，加入最后一个隐含层；
+        5. 执行最后的layer_norm
+        输出hidden_states, presents, all_hidden_states, all_self_attentions
+
+        每个layer执行的操作如下：
+        1. 上个block的输入，首先进行input_layernorm;
+        2. 然后执行self_attention:
+            2.1. [sq,b,h]的hidden_states输入进来以后，先执行query_key_value,将它们映射到一个统一的空间
+                如果使用MQA技术，则映射维度为proj_dim + 2 * head_dim * group_num;
+                如果不使用MQA技术，则映射维度为3*proj_dim
+            2.2. 将query_key_value分割，
+                如果使用MQA，三个划分维度为[num_head * head_dim, num_group * head_dim, num*group * head_dim]
+                如果不使用MQA，则全部为num_head * head_dim
+            2.3. 如有，将ROPE信息加入query, key
+            2.4. 如有，将新的key,value与kv_cache合并
+            2.5. 在key,value倒是第二个维度的位置增加一个维度，使用Tensor.expand方法将新增的维度拓展到num_heads/num_group维,
+                然后转换为[sq,b,num_heads,head_dim],初始时为[sq,b num_group,head_dim]
+            2.6. 执行scaled_dot_product_attention操作，得到context_layer
+            2.7. 执行线性映射，将proj_dim改为hidden_dim,输出结果attention_output和kv_cache
+        3. 对attention_output执行dropout
+        4. 若执行residual connection_post_layernorm, 将input_layernorm后的结果作为residual
+            否则以hidden_state为residual;
+        5. 执行post_layernorm;
+        6. post_layernorm输入MLP,执行position_wise mlp;
+        7. 再执行dropout和residual connection,步骤与前述3-4一致；
+        """
         if not kv_caches:
             kv_caches = [None for _ in range(self.num_layers)]
         presents = () if use_cache else None
@@ -709,6 +801,7 @@ class Embedding(torch.nn.Module):
 
         self.hidden_size = config.hidden_size
         # Word embeddings (parallel).
+        # 
         self.word_embeddings = nn.Embedding(
             config.padded_vocab_size,
             self.hidden_size,
@@ -718,6 +811,12 @@ class Embedding(torch.nn.Module):
         self.fp32_residual_connection = config.fp32_residual_connection
 
     def forward(self, input_ids):
+        """ 
+        1. word_embedding的输入为[batch,seq]
+            word_embedding为[padded_vocab_size, hidden_size]
+            即定义一个查找表，每个数字的向量为hidden_size,查找表的大小为padded_vocab_size
+            得到[batch,seq,hidden_size]的tensor
+        """
         # Embeddings.
         words_embeddings = self.word_embeddings(input_ids)
         embeddings = words_embeddings
@@ -731,6 +830,10 @@ class Embedding(torch.nn.Module):
 
 class ChatGLMModel(ChatGLMPreTrainedModel):
     def __init__(self, config: ChatGLMConfig, device=None, empty_init=True):
+        """ 
+        1. self.pre_seq_len 为ptuning或prefix tuning的virtual tokens的数量
+        2. 
+        """
         super().__init__(config)
         if empty_init:
             init_method = skip_init
@@ -795,6 +898,16 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
     ):
+        """ 
+        1. input_ids的维度为[batch,seq,padded_vocab_size], 输出为[batch,seq,hidden_size]
+        2. 如果定义了pre_seq_len，即定义了使用ptuning：
+            如果past_key_values为None, 则调用get_prompt构造ptuning的past_key_values
+            如果attention_mask不为None,则为virtual token也定义掩码，并合并掩码；
+        3. 如果未定义full_attention_mask,则调用get_mask构造full_attention_mask;
+        4. 执行ROPE，加入绝对位置信息；
+        5. 执行transformer,得到hidden_states, presents, all_hidden_states, all_self_attentions
+        并返回结果
+        """
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -928,6 +1041,9 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
             return_dict: Optional[bool] = None,
             return_last_logit: Optional[bool] = False,
     ):
+        """ 
+        1. 除第一次外，只使用最后一个字符，使用kv_cache和GQA技术进行
+        """
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1143,6 +1259,8 @@ class ChatGLMForConditionalGeneration(ChatGLMPreTrainedModel):
         unfinished_sequences = input_ids.new(input_ids.shape[0]).fill_(1)
         scores = None
         while True:
+            #! prepare_inputs_for_generation只在第一次使用全部的input_ids
+            # 第一次以后只使用最后一个字符
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             # forward pass to get next token
             # outputs -> [b,sq,vocab_size]
