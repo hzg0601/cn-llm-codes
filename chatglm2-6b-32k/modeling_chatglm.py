@@ -391,6 +391,9 @@ class SelfAttention(torch.nn.Module):
         6. 执行scaled_dot_product_attention操作，得到context_layer
         7. 执行线性映射，将proj_dim改为hidden_dim
 
+        为什么只缓存k,v不缓存q--> hidden_state输入时只是一个token的hidden_state,经q,k,v project之后，得到的
+        也只是一个token的q,k,v，因为只想要预测一个token的logits，但想要计算针对整个句子的注意力值，因此，只需要
+        缓存k,v用以计算对整个序列的注意力即可
         """
         # hidden_states: [sq, b, h]
 
@@ -899,12 +902,12 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             return_dict: Optional[bool] = None,
     ):
         """ 
-        1. input_ids的维度为[batch,seq,padded_vocab_size], 输出为[batch,seq,hidden_size]
+        1. input_ids的维度为[batch,seq], 输出为[batch,seq,hidden_size]
         2. 如果定义了pre_seq_len，即定义了使用ptuning：
             如果past_key_values为None, 则调用get_prompt构造ptuning的past_key_values
             如果attention_mask不为None,则为virtual token也定义掩码，并合并掩码；
         3. 如果未定义full_attention_mask,则调用get_mask构造full_attention_mask;
-        4. 执行ROPE，加入绝对位置信息；
+        4. 执行ROPE，加入绝对位置信息，即先embedding后加入位置信息
         5. 执行transformer,得到hidden_states, presents, all_hidden_states, all_self_attentions
         并返回结果
         """
