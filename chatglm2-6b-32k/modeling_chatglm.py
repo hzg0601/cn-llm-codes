@@ -1,4 +1,10 @@
-""" PyTorch ChatGLM model. """
+""" PyTorch ChatGLM model. 
+相较于chatglm2-6b主要更新点：
+1. 使用了prefix-encoding
+2. rotary-embedding增加了rope_ratio参数
+3. 增加了gradient_checkpoint选项；
+4. 
+"""
 
 import math
 import copy
@@ -117,6 +123,11 @@ def split_tensor_along_last_dim(
 
 
 class RotaryEmbedding(nn.Module):
+    """
+    1. 计算三角函数的分母10000^{2t/d},并注册到全局的buffer中;
+    2. 
+
+    """
     def __init__(self, dim, rope_ratio=1, original_impl=False, device=None, dtype=None):
         super().__init__()
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=device).to(dtype=dtype) / dim))
@@ -129,10 +140,16 @@ class RotaryEmbedding(nn.Module):
             self, seq_len: int, n_elem: int, dtype: torch.dtype, device: torch.device, base: int = 10000
     ):
         """Enhanced Transformer with Rotary Position Embedding.
+        $f_q(x_m,m) = (W_q x_m)e^{im\theta}$
+        $f_k(x_n,n) = (W_k x_n)e^{in\theta}$
 
         Derived from: https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/labml_nn/
         transformers/rope/__init__.py. MIT License:
         https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/license.
+        1. 计算全局三角函数的分母，即参数化的inv_freq，(n_elem/2,)；
+        2. 计算seq_idx,基于rope_ratio，进行归一化 (seq_len,);
+        3. 计算theta,seq_idx的外积,得到公式中m\theta ,(n_elem/2, seq_len)；
+        4. 计算m\theta的正余弦值，并拼接，(n_elm/2, seq_len,2)
         """
         # $\Theta = {\theta_i = 10000^{\frac{2(i-1)}{d}}, i \in [1, 2, ..., \frac{d}{2}]}$
         theta = 1.0 / (base ** (torch.arange(0, n_elem, 2, dtype=dtype, device=device) / n_elem))
@@ -158,7 +175,13 @@ class RotaryEmbedding(nn.Module):
 
 @torch.jit.script
 def apply_rotary_pos_emb(x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-    # x: [sq, b, np, hn]
+    # x: [sq, b, np, hn],seq_len, batch_size, num_head, hidden_size_per_head
+    # rope_cache: [seq_len n_elem/2, 2]->[seq_len, rotary_dim//2/2, 2] rotary_dim = hidden_size//num_head
+    # rot_dim =  hidden_size//num_head/2, 
+    # x->[seq,b,np,rot_dim], rope_cache->[seq,rot_dim//2,2]
+    # xshaped -> [seq,b,np,rot_dim//2, 2] rope_cache -> [seq, 1, 1,rot_dim//2, 2] ,x_out2=[seq,b,np,rot_dim//2,2]
+    # x_out2 -> [seq,b,np,rot_dim]
+    #? return [seq,b,np,hn]，即只更新一半的位置信息?
     sq, b, np, hn = x.size(0), x.size(1), x.size(2), x.size(3)
     rot_dim = rope_cache.shape[-2] * 2
     x, x_pass = x[..., :rot_dim], x[..., rot_dim:]
@@ -217,7 +240,8 @@ class CoreAttention(torch.nn.Module):
 
         self.attention_dropout = torch.nn.Dropout(config.attention_dropout)
 
-    def forward(self, query_layer, key_layer, value_layer, attention_mask):
+    def forward(self, query_layer, key_layer, value_layer, attention_mask):\
+        # scaled_dot_product_attention, 即torch会自动选择三种执行方式，其中第一种为Flash_attention
         pytorch_major_version = int(torch.__version__.split('.')[0])
         if pytorch_major_version >= 2:
             query_layer, key_layer, value_layer = [k.permute(1, 2, 0, 3) for k in [query_layer, key_layer, value_layer]]
@@ -850,7 +874,8 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
         self.multi_query_group_num = config.multi_query_group_num
         self.kv_channels = config.kv_channels
 
-        # Rotary positional embeddings
+        # Rotary positional embeddings, 在ROPE中，每个position_encoding的维度与每个注意力头的维度必须一致
+        # 但由于ROPE的位置信息是正余弦x_dim \oplus cos_{rotary_dim} + x_dim_diff \oplus sin(rotary_dim)
         self.seq_length = config.seq_length
         rotary_dim = (
             config.hidden_size // config.num_attention_heads if config.kv_channels is None else config.kv_channels
@@ -907,7 +932,8 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             如果past_key_values为None, 则调用get_prompt构造ptuning的past_key_values
             如果attention_mask不为None,则为virtual token也定义掩码，并合并掩码；
         3. 如果未定义full_attention_mask,则调用get_mask构造full_attention_mask;
-        4. 执行ROPE，加入绝对位置信息，即先embedding后加入位置信息
+        4. 计算ROPE编码的初始正余弦值，如果给定了position_ids，则按position_id取值，否则只取前seq_len个，
+           并交换正余弦值的第0,1维，将其变为(seq_len, rotary_dim/2, 2)
         5. 执行transformer,得到hidden_states, presents, all_hidden_states, all_self_attentions
         并返回结果
         """
@@ -934,7 +960,7 @@ class ChatGLMModel(ChatGLMPreTrainedModel):
             if (attention_mask is not None and not attention_mask.all()) or (past_key_values and seq_length != 1):
                 full_attention_mask = self.get_masks(input_ids, past_key_values, padding_mask=attention_mask)
 
-        # Rotary positional embeddings
+        # Rotary positional embeddings,(rotary_dim // 2, seq_len,2)
         rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
         if position_ids is not None:
             rotary_pos_emb = rotary_pos_emb[position_ids]
